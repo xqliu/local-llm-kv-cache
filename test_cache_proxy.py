@@ -183,6 +183,20 @@ class CacheProxyTests(unittest.TestCase):
         self.assertEqual(request["id_slot"], 0)
         self.assertEqual(len(FakeLlamaHandler.restored), restored_before)
 
+    def test_session_snapshot_wins_after_switching_same_prefix_session(self):
+        _, first_plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(first_plan, 200)
+        _, second_plan = self.proxy.prepare(self.body, "session-b")
+        self.proxy.finish(second_plan, 200)
+        FakeLlamaHandler.restored = []
+
+        self.proxy.prepare(self.body, "session-a")
+
+        self.assertEqual(
+            FakeLlamaHandler.restored,
+            [cache_filename("session-a", self.body, "session")],
+        )
+
     def test_prefix_seed_payload_stops_before_user_message(self):
         body = {
             **self.body,

@@ -100,24 +100,21 @@ class LlamaCacheProxy:
             slot_id = hot_state.slot_id
             LOGGER.info("reusing hot session %s in slot %d", session_id, slot_id)
         else:
-            hot_state = self._hot_state(self.prefix_states.get(prefix_key), prefix_key)
-            if hot_state is not None:
-                slot_id = hot_state.slot_id
-                self._forget_slot(slot_id)
-                LOGGER.info("reusing hot prefix %s in slot %d", prefix_key[:12], slot_id)
-            else:
+            hot_state = None
+            if session_file.exists():
                 slot_id = self._wait_for_idle_slot()
                 self._forget_slot(slot_id)
-                sources = [path for path in (session_file, prefix_file) if path.exists()]
-                for source in sources:
-                    try:
-                        self._restore(slot_id, source)
-                    except RuntimeError as error:
-                        LOGGER.warning("could not restore %s: %s; continuing without disk restore", source.name, error)
-                        continue
-                    restored_source = source
-                    LOGGER.info("restored %s into slot %d", source.name, slot_id)
-                    break
+                restored_source = self._restore_first_available(slot_id, (session_file, prefix_file))
+            if restored_source is None:
+                hot_state = self._hot_state(self.prefix_states.get(prefix_key), prefix_key)
+                if hot_state is not None:
+                    slot_id = hot_state.slot_id
+                    self._forget_slot(slot_id)
+                    LOGGER.info("reusing hot prefix %s in slot %d", prefix_key[:12], slot_id)
+                else:
+                    slot_id = self._wait_for_idle_slot()
+                    self._forget_slot(slot_id)
+                    restored_source = self._restore_first_available(slot_id, (prefix_file,))
         plan = SnapshotPlan(
             session_id=session_id,
             slot_id=slot_id,
@@ -128,6 +125,19 @@ class LlamaCacheProxy:
             prefix_was_present=prefix_file.exists() and (restored_source is not None or hot_state is not None),
         )
         return with_slot_cache(body, slot_id), plan
+
+    def _restore_first_available(self, slot_id: int, sources: tuple[Path, ...]) -> Path | None:
+        for source in sources:
+            if not source.exists():
+                continue
+            try:
+                self._restore(slot_id, source)
+            except RuntimeError as error:
+                LOGGER.warning("could not restore %s: %s; continuing without disk restore", source.name, error)
+                continue
+            LOGGER.info("restored %s into slot %d", source.name, slot_id)
+            return source
+        return None
 
     def finish(self, plan: SnapshotPlan, status: int) -> None:
         if status < 200 or status >= 300:
