@@ -234,19 +234,18 @@ class LlamaCacheProxy:
     def foreground_operation(self):
         with self.foreground_waiters_lock:
             self.foreground_waiters += 1
-        acquired = False
         try:
             self.operation_lock.acquire()
-            acquired = True
+        except BaseException:
             with self.foreground_waiters_lock:
                 self.foreground_waiters -= 1
+            raise
+        with self.foreground_waiters_lock:
+            self.foreground_waiters -= 1
+        try:
             yield
         finally:
-            if not acquired:
-                with self.foreground_waiters_lock:
-                    self.foreground_waiters -= 1
-            if acquired:
-                self.operation_lock.release()
+            self.operation_lock.release()
 
     def forward(self, handler: BaseHTTPRequestHandler, method: str, path: str, body: bytes) -> int:
         upstream = HTTPConnection(self.upstream_host, self.upstream_port, timeout=1200)

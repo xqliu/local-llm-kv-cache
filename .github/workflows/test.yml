@@ -23,8 +23,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Run unit tests
-        run: python -m unittest discover -s . -p 'test_*.py' -v
+      - name: Install coverage
+        run: python -m pip install coverage
+
+      - name: Run unit tests with branch coverage
+        run: |
+          python -m coverage run --branch --source=. -m unittest discover -s . -p 'test_*.py' -v
+          python -m coverage report --include='cache_core.py,cache_proxy.py' --fail-under=100
 
       - name: Compile Python modules
         run: python -m py_compile cache_core.py cache_proxy.py

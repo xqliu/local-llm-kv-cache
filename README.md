@@ -283,6 +283,9 @@ API timings：timings.cache_n > 0
 cd ~/.local/share/local-llm-kv-cache
 python3 -m unittest -v test_cache_core.py test_cache_proxy.py
 python3 -m py_compile cache_core.py cache_proxy.py
+python3 -m pip install coverage
+python3 -m coverage run --branch --source=. -m unittest discover -s . -p 'test_*.py' -v
+python3 -m coverage report --include='cache_core.py,cache_proxy.py' --fail-under=100
 ```
 
 ## 当前配置入口
