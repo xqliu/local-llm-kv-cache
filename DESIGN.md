@@ -28,8 +28,8 @@ flowchart LR
     subgraph CACHE["Cache Proxy"]
         A["Session affinity"]
         K["Prefix key builder"]
-        H["Hot slot maps<br/>session_states / prefix_states"]
-        R["Hit selection<br/>hot -> disk -> miss"]
+        H["Hot slot map<br/>session_states"]
+        R["Hit selection<br/>session hot -> disk -> miss"]
         S["Snapshot manager"]
         A --> K --> R
         H --> R
@@ -160,16 +160,14 @@ flowchart TD
     ID --> KEY["Build prefix_key"]
     KEY --> HOTS{"Hot session matches?"}
     HOTS -->|yes| HS["Reuse hot session slot"]
-    HOTS -->|no| HOTP{"Hot prefix matches?"}
-    HOTP -->|yes| HP["Reuse hot prefix slot"]
-    HOTP -->|no| DS{"Disk session snapshot exists?"}
+    HOTS -->|no| SLOT["Choose unowned idle slot"]
+    SLOT --> DS{"Disk session snapshot exists?"}
     DS -->|yes and restore succeeds| DSR["Restore session snapshot"]
     DS -->|no or restore fails| DP{"Disk prefix snapshot exists?"}
     DP -->|yes and restore succeeds| DPR["Restore prefix snapshot"]
-    DP -->|no or restore fails| MISS["Use idle slot and full prefill"]
+    DP -->|no or restore fails| MISS["Use selected slot and full prefill"]
 
     HS --> SEND["cache_prompt=true + id_slot"]
-    HP --> SEND
     DSR --> SEND
     DPR --> SEND
     MISS --> SEND
@@ -197,9 +195,9 @@ session_id -> slot_id + prefix_key + n_tokens
 - llama slot 仍然 idle；
 - 当前 token 数等于上次保存的 token 数。
 
-### 5.2 Hot prefix
+### 5.2 Prefix fallback
 
-新 session 没有 hot session 时，可以按照相同 prefix key 复用仍在内存中的 slot。llama.cpp 收到新的完整 prompt 后，通过 cache_prompt=true 找共同 token 前缀，只处理变化的 suffix。
+代理不维护跨 session 的 hot prefix 所有权。这样一个新 session 不会为了复用另一个 session 的 prefix 而覆盖其完整动态历史。代理先选择没有 session 所有权的空闲 slot，再尝试恢复 `local-llm-prefix-*.bin`；如果没有安全空闲 slot，则选择最少 prompt token 的空闲 slot并依赖 llama.cpp 的 `cache_prompt=true` 做自然的 common-prefix 匹配。
 
 ### 5.3 Disk prefix
 
@@ -225,8 +223,9 @@ sequenceDiagram
     P->>P: Build session_id and prefix_key
     P->>L: GET /slots
     L-->>P: Find idle slot
+    P->>L: Choose unowned idle slot
     P->>L: POST /slots/id?action=restore
-    L->>D: Read local-llm-prefix snapshot
+    L->>D: Read session snapshot, then prefix fallback
     D-->>L: KV + recurrent state
     L-->>P: Restore complete
     P->>L: Chat request with cache_prompt=true, id_slot
@@ -279,16 +278,15 @@ Turn 2 不会直接返回 Turn 1 的答案。它仍然经过 prompt matching 和
 flowchart TD
     R["Successful response"] --> WAIT["Wait 2 seconds"]
     WAIT --> FRONT{"Foreground request waiting?"}
-    FRONT -->|yes| RETRY["Wait and retry"]
+    FRONT -->|yes| SKIP["Skip seed"]
     FRONT -->|no| LOCK{"Proxy operation lock available?"}
-    LOCK -->|no| RETRY
-    LOCK -->|yes| SLOT["Find idle slot"]
-    SLOT --> RESERVED{"Slot belongs to active session?"}
-    RESERVED -->|yes| RETRY
-    RESERVED -->|no| SEED["Run pure prefix request"]
+    LOCK -->|no| SKIP
+    LOCK -->|yes| SLOT["Find unowned idle slot"]
+    SLOT --> RESERVED{"Safe slot exists?"}
+    RESERVED -->|no| SKIP
+    RESERVED -->|yes| SEED["Run pure prefix request"]
     SEED --> SAVE["Save local-llm-prefix snapshot"]
     SAVE --> DONE["Release slot and finish"]
-    RETRY --> WAIT
 ~~~
 
 prefix seed 使用：
@@ -303,7 +301,7 @@ prefix seed 使用：
 }
 ~~~
 
-它不会抢占活跃 session 的 slot。没有安全空闲 slot 时会等待或超时放弃。
+它不会抢占活跃 session 的 slot。没有安全空闲 slot、代理忙或前台请求排队时立即跳过；seed 是 best-effort，不属于 session 正确性链路。
 
 ## 9. 缓存不是答案缓存
 
@@ -373,8 +371,8 @@ restore 失败只会降级为普通 prefill，不会直接让用户请求失败�
 - 不减少模型权重显存；
 - 不提高 decode tokens/s；
 - snapshot 约 150–240 MB/个，缓存上限 12 GiB；
-- 首次请求完成后会额外做一次后台 prefix prefill；
-- 缓存请求使用全局 operation lock，优先保证 snapshot 不互相覆盖；
+- prefix seed 是可丢弃的 best-effort 优化，没有安全 slot 时立即跳过；
+- 缓存请求使用全局 operation lock，优先保证 snapshot 不互相覆盖；prefix seed 不等待前台请求，竞争到前台请求时跳过；
 - 缓存目录包含本地 prompt/KV 状态，只保留在本机用户目录。
 
 ## 12. 关键文件

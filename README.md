@@ -43,7 +43,7 @@ Pi / pi-acp / Zed
           v
 127.0.0.1:18082  cache_proxy.py
           |
-          +-- 内存 session/prefix slot 映射
+          +-- 内存 session slot 映射
           +-- ~/.llama-slot-cache/*.bin
           |
           v
@@ -51,6 +51,16 @@ Pi / pi-acp / Zed
 ```
 
 代理只监听 loopback，没有暴露到局域网或公网。
+
+### Slot ownership
+
+同一个 session 的 slot 状态是代理的唯一内存真相。请求不会为了复用另一个 session 的稳定 prefix 而抢占其完整上下文；没有可用的 hot session 时，代理优先选择没有 session 所有权的空闲 slot，再按以下顺序恢复：
+
+```text
+hot session → session snapshot → prefix snapshot → full prefill
+```
+
+这样多个 Pi、Zed session 交替使用时，失去内存 slot 的 session 仍能从自己的完整快照恢复，不会把另一个 session 的动态历史当成自己的缓存。
 
 ## Cache key
 
@@ -133,7 +143,7 @@ local-llm-prefix-<hash>.bin
 | 层级 | 条件 | 动作 |
 |---|---|---|
 | 同 session 热缓存 | session ID、prefix key 相同，slot idle，token 数一致 | 直接复用内存 slot，不读盘 |
-| 跨 session 热 prefix | prefix key 相同，slot idle，token 数一致 | 复用内存 slot 的共同前缀 |
+| 空闲 slot | hot session 不可用 | 优先选择没有 session 所有权的 slot，避免驱逐其他活跃会话 |
 | 磁盘 session 快照 | `local-llm-session-*.bin` 存在且 restore 成功 | 恢复具体会话 |
 | 磁盘 prefix 快照 | `local-llm-prefix-*.bin` 存在且 restore 成功 | 恢复项目稳定前缀 |
 | 缓存未命中 | 上述条件都不满足 | 完整 prefill |
@@ -155,11 +165,11 @@ local-llm-prefix-<hash>.bin
 当前 slot -> local-llm-session-<hash>.bin
 ```
 
-同时更新内存中的 session 和 prefix slot 映射。
+同时更新内存中的 session slot 映射。
 
 ### 4. 后台生成纯 prefix
 
-如果项目还没有纯 prefix 文件，代理等待前台请求结束，然后在安全的空闲 slot 中发送一个内部请求：
+如果项目还没有纯 prefix 文件，代理可以在安全的空闲 slot 中发送一个内部请求：
 
 ```json
 {
@@ -171,7 +181,7 @@ local-llm-prefix-<hash>.bin
 }
 ```
 
-这个请求的 slot 会被保存为 `local-llm-prefix-<hash>.bin`。它不会抢占活跃 session 的 slot；没有安全的空闲 slot 时会等待或超时放弃。
+这个请求的 slot 会被保存为 `local-llm-prefix-<hash>.bin`。它不会抢占活跃 session 的 slot；没有安全的空闲 slot、代理忙或有前台请求排队时，会立即跳过。这是可丢弃的 best-effort 优化，不参与 session 正确性。
 
 纯 prefix 快照很重要。Qwen3.8 是混合 GDN 架构，不能可靠地把“包含旧 user/assistant 历史的完整快照”直接当作所有新 session 的 prefix。纯 prefix 恢复后，llama.cpp 才能把新用户消息作为 suffix 继续计算。
 
@@ -238,8 +248,8 @@ restore 失败不会让请求失败。代理会记录 warning，继续使用当�
 
 - 这是 prompt prefill 优化，不会减少模型权重显存，也不会提高模型 decode 本身的 tokens/s；
 - slot snapshot 文件较大，当前验证文件约为每个 150–240 MB，12 GiB 上限约束了可保留的快照数量；
-- 首次请求成功后会额外进行一次后台 prefix prefill，这是用一次空闲计算换取之后的新 session 低延迟；
-- 缓存请求通过全局 operation lock 串行化，优先保证 slot snapshot 不互相覆盖；家庭场景的低并发下这个取舍是合适的；
+- prefix seed 是可丢弃的 best-effort 优化；没有安全空闲 slot 时立即跳过，不阻塞前台请求；
+- 缓存请求通过全局 operation lock 串行化，优先保证 slot snapshot 不互相覆盖；高并发客户端会排队等待空闲 slot；
 - 缓存文件包含本地 prompt/KV 状态，只应保留在本机 loopback 和用户目录，不应把 18082 暴露出去。
 
 ## 运行和排查
@@ -262,7 +272,7 @@ curl -fsS http://127.0.0.1:18082/v1/models
 确认真正命中：
 
 ```text
-代理日志：reusing hot session / reusing hot prefix / restored local-llm-prefix-...
+代理日志：reusing hot session / restored local-llm-session-... / restored local-llm-prefix-...
 API 响应：usage.prompt_tokens_details.cached_tokens > 0
 API timings：timings.cache_n > 0
 ```

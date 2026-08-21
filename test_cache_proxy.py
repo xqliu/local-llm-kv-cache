@@ -6,9 +6,10 @@ from contextlib import contextmanager
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import Mock, patch
 
-from cache_core import cache_filename
-from cache_proxy import LlamaCacheProxy, ProxyHandler, _anonymous_session_id
+from cache_core import cache_filename, cache_key
+from cache_proxy import LlamaCacheProxy, ProxyHandler, SlotState, _anonymous_session_id
 
 
 class FakeLlamaHandler(BaseHTTPRequestHandler):
@@ -196,6 +197,64 @@ class CacheProxyTests(unittest.TestCase):
             FakeLlamaHandler.restored,
             [cache_filename("session-a", self.body, "session")],
         )
+
+    def test_new_session_uses_unowned_idle_slot_before_evicting_session(self):
+        self.proxy.session_states["session-a"] = SlotState(1, cache_key(self.body), 10)
+        slots = [
+            {"id": 0, "is_processing": False, "n_prompt_tokens": 0},
+            {"id": 1, "is_processing": False, "n_prompt_tokens": 10},
+        ]
+
+        with patch.object(self.proxy, "_slots", return_value=slots):
+            request, _ = self.proxy.prepare(self.body, "session-b")
+
+        self.assertEqual(request["id_slot"], 0)
+
+    def test_prefix_seed_skips_when_no_safe_idle_slot_exists(self):
+        self.proxy.session_states["session-a"] = SlotState(1, cache_key(self.body), 10)
+        self.proxy.prefix_seed_delay_seconds = 0
+        self.proxy._slots = Mock(
+            return_value=[
+                {"id": 0, "is_processing": True, "n_prompt_tokens": 10},
+                {"id": 1, "is_processing": False, "n_prompt_tokens": 10},
+            ]
+        )
+        self.proxy._json_request = Mock()
+        self.proxy._save = Mock()
+
+        self.proxy._seed_prefix(
+            {"messages": [{"role": "system", "content": "rules"}]},
+            Path(self.tempdir.name, "prefix.bin"),
+            excluded_slot_id=1,
+        )
+
+        self.proxy._json_request.assert_not_called()
+        self.proxy._save.assert_not_called()
+
+    def test_prefix_seed_uses_unowned_idle_slot(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        self.proxy._slots = Mock(
+            return_value=[
+                {"id": 0, "is_processing": False, "n_prompt_tokens": 3},
+                {"id": 1, "is_processing": False, "n_prompt_tokens": 10},
+            ]
+        )
+        self.proxy._json_request = Mock(return_value={})
+        self.proxy._save = Mock(return_value=10)
+        self.proxy._forget_slot = Mock()
+        self.proxy._prune = Mock()
+        prefix_file = Path(self.tempdir.name, "prefix.bin")
+
+        self.proxy._seed_prefix(
+            {"messages": [{"role": "system", "content": "rules"}]},
+            prefix_file,
+            excluded_slot_id=1,
+        )
+
+        request = self.proxy._json_request.call_args.args[2]
+        self.assertEqual(request["id_slot"], 0)
+        self.proxy._save.assert_called_once_with(0, prefix_file)
+        self.proxy._prune.assert_called_once_with()
 
     def test_prefix_seed_payload_stops_before_user_message(self):
         body = {

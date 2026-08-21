@@ -83,7 +83,6 @@ class LlamaCacheProxy:
         self.prefix_seed_delay_seconds = prefix_seed_delay_seconds
         self.operation_lock = threading.Lock()
         self.session_states: dict[str, SlotState] = {}
-        self.prefix_states: dict[str, SlotState] = {}
         self.prefix_seed_lock = threading.Lock()
         self.prefix_seeds_in_flight: set[Path] = set()
         self.foreground_waiters = 0
@@ -101,20 +100,9 @@ class LlamaCacheProxy:
             LOGGER.info("reusing hot session %s in slot %d", session_id, slot_id)
         else:
             hot_state = None
-            if session_file.exists():
-                slot_id = self._wait_for_idle_slot()
-                self._forget_slot(slot_id)
-                restored_source = self._restore_first_available(slot_id, (session_file, prefix_file))
-            if restored_source is None:
-                hot_state = self._hot_state(self.prefix_states.get(prefix_key), prefix_key)
-                if hot_state is not None:
-                    slot_id = hot_state.slot_id
-                    self._forget_slot(slot_id)
-                    LOGGER.info("reusing hot prefix %s in slot %d", prefix_key[:12], slot_id)
-                else:
-                    slot_id = self._wait_for_idle_slot()
-                    self._forget_slot(slot_id)
-                    restored_source = self._restore_first_available(slot_id, (prefix_file,))
+            slot_id = self._wait_for_idle_slot()
+            self._forget_slot(slot_id)
+            restored_source = self._restore_first_available(slot_id, (session_file, prefix_file))
         plan = SnapshotPlan(
             session_id=session_id,
             slot_id=slot_id,
@@ -145,7 +133,6 @@ class LlamaCacheProxy:
         n_saved = self._save(plan.slot_id, plan.session_file)
         state = SlotState(plan.slot_id, plan.prefix_key, n_saved)
         self.session_states[plan.session_id] = state
-        self.prefix_states[plan.prefix_key] = state
         if not plan.prefix_was_present:
             self._schedule_prefix_seed(plan)
         self._prune()
@@ -166,9 +153,6 @@ class LlamaCacheProxy:
     def _forget_slot(self, slot_id: int) -> None:
         self.session_states = {
             key: state for key, state in self.session_states.items() if state.slot_id != slot_id
-        }
-        self.prefix_states = {
-            key: state for key, state in self.prefix_states.items() if state.slot_id != slot_id
         }
 
     @staticmethod
@@ -203,37 +187,31 @@ class LlamaCacheProxy:
     def _seed_prefix(self, prefix_payload: dict[str, Any], prefix_file: Path, excluded_slot_id: int) -> None:
         try:
             time.sleep(self.prefix_seed_delay_seconds)
-            deadline = time.monotonic() + self.wait_seconds
-            while time.monotonic() < deadline:
-                if self._has_foreground_waiters():
-                    time.sleep(0.5)
-                    continue
-                if not self.operation_lock.acquire(blocking=False):
-                    time.sleep(0.5)
-                    continue
-                try:
-                    reserved_slots = {excluded_slot_id}
-                    reserved_slots.update(state.slot_id for state in self.session_states.values())
-                    idle_slots = [
-                        slot
-                        for slot in self._slots()
-                        if not slot.get("is_processing") and int(slot.get("id", -1)) not in reserved_slots
-                    ]
-                    if not idle_slots:
-                        time.sleep(1.0)
-                        continue
-                    slot_id = min(idle_slots, key=lambda slot: int(slot.get("n_prompt_tokens") or 0)).get("id", 0)
-                    request = self._prefix_seed_payload(prefix_payload)
-                    request["id_slot"] = int(slot_id)
-                    self._json_request("POST", "/v1/chat/completions", request)
-                    self._save(int(slot_id), prefix_file)
-                    self._forget_slot(int(slot_id))
-                    self._prune()
-                    LOGGER.info("seeded stable prefix -> %s", prefix_file.name)
+            if self._has_foreground_waiters():
+                LOGGER.info("prefix seed skipped while foreground request is waiting: %s", prefix_file.name)
+                return
+            if not self.operation_lock.acquire(blocking=False):
+                LOGGER.info("prefix seed skipped while proxy is busy: %s", prefix_file.name)
+                return
+            try:
+                idle_slots = [
+                    slot
+                    for slot in self._idle_slots({excluded_slot_id})
+                    if int(slot.get("id", -1)) not in {state.slot_id for state in self.session_states.values()}
+                ]
+                if not idle_slots:
+                    LOGGER.info("prefix seed skipped: no safe idle slot: %s", prefix_file.name)
                     return
-                finally:
-                    self.operation_lock.release()
-            LOGGER.info("prefix seed timed out waiting for a safe idle slot: %s", prefix_file.name)
+                slot_id = min(idle_slots, key=lambda slot: int(slot.get("n_prompt_tokens") or 0)).get("id", 0)
+                request = self._prefix_seed_payload(prefix_payload)
+                request["id_slot"] = int(slot_id)
+                self._json_request("POST", "/v1/chat/completions", request)
+                self._save(int(slot_id), prefix_file)
+                self._forget_slot(int(slot_id))
+                self._prune()
+                LOGGER.info("seeded stable prefix -> %s", prefix_file.name)
+            finally:
+                self.operation_lock.release()
         except Exception:
             LOGGER.exception("prefix seed failed: %s", prefix_file.name)
         finally:
@@ -243,6 +221,14 @@ class LlamaCacheProxy:
     def _has_foreground_waiters(self) -> bool:
         with self.foreground_waiters_lock:
             return self.foreground_waiters > 0
+
+    def _idle_slots(self, excluded_slot_ids: set[int] | None = None) -> list[dict[str, Any]]:
+        excluded = excluded_slot_ids or set()
+        return [
+            slot
+            for slot in self._slots()
+            if not slot.get("is_processing") and int(slot.get("id", -1)) not in excluded
+        ]
 
     @contextmanager
     def foreground_operation(self):
@@ -334,9 +320,12 @@ class LlamaCacheProxy:
     def _wait_for_idle_slot(self) -> int:
         deadline = time.monotonic() + self.wait_seconds
         while time.monotonic() < deadline:
-            slots = [slot for slot in self._slots() if not slot.get("is_processing")]
+            slots = self._idle_slots()
             if slots:
-                return min(slots, key=lambda slot: int(slot.get("n_prompt_tokens") or 0)).get("id", 0)
+                owned_slots = {state.slot_id for state in self.session_states.values()}
+                unowned_slots = [slot for slot in slots if int(slot.get("id", -1)) not in owned_slots]
+                candidates = unowned_slots or slots
+                return min(candidates, key=lambda slot: int(slot.get("n_prompt_tokens") or 0)).get("id", 0)
             time.sleep(0.5)
         raise TimeoutError("no idle llama slot became available")
 
