@@ -1,0 +1,21 @@
+[Unit]
+Description=Pi session-aware llama.cpp KV cache proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/pi-llama-cache
+ExecStart=/usr/bin/python3 %h/.local/share/pi-llama-cache/cache_proxy.py
+Environment=PI_LLAMA_UPSTREAM=http://127.0.0.1:8080
+Environment=PI_LLAMA_CACHE_HOST=127.0.0.1
+Environment=PI_LLAMA_CACHE_PORT=18082
+Environment=PI_LLAMA_CACHE_DIR=%h/.llama-slot-cache
+Environment=PI_LLAMA_CACHE_MAX_GIB=12
+Environment=PI_LLAMA_CACHE_WAIT_SECONDS=120
+Environment=PI_LLAMA_CACHE_PREFIX_SEED_DELAY=2
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
