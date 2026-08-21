@@ -1,4 +1,4 @@
-# Pi / Zed 本地 Qwen3.8-27B 缓存方案
+# Local LLM KV Cache
 
 这套方案为本机的 Pi、Zed 编程 agent 增加两级缓存：
 
@@ -14,11 +14,11 @@
 要求：Python 3.10+，以及已经运行并开启 slot save/restore 的 llama.cpp server。
 
 ```bash
-git clone https://github.com/xqliu/pi-llama-cache.git ~/.local/share/pi-llama-cache
+git clone https://github.com/xqliu/local-llm-kv-cache.git ~/.local/share/local-llm-kv-cache
 mkdir -p ~/.config/systemd/user
-cp ~/.local/share/pi-llama-cache/pi-llama-cache.service ~/.config/systemd/user/
+cp ~/.local/share/local-llm-kv-cache/local-llm-kv-cache.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now pi-llama-cache.service
+systemctl --user enable --now local-llm-kv-cache.service
 curl -fsS http://127.0.0.1:18082/health
 ```
 
@@ -100,8 +100,8 @@ snapshot_key = SHA256("2" + kind + identity + prefix_key)
 文件格式：
 
 ```text
-pi-session-<hash>.bin
-pi-prefix-<hash>.bin
+local-llm-session-<hash>.bin
+local-llm-prefix-<hash>.bin
 ```
 
 其中：
@@ -134,8 +134,8 @@ pi-prefix-<hash>.bin
 |---|---|---|
 | 同 session 热缓存 | session ID、prefix key 相同，slot idle，token 数一致 | 直接复用内存 slot，不读盘 |
 | 跨 session 热 prefix | prefix key 相同，slot idle，token 数一致 | 复用内存 slot 的共同前缀 |
-| 磁盘 session 快照 | `pi-session-*.bin` 存在且 restore 成功 | 恢复具体会话 |
-| 磁盘 prefix 快照 | `pi-prefix-*.bin` 存在且 restore 成功 | 恢复项目稳定前缀 |
+| 磁盘 session 快照 | `local-llm-session-*.bin` 存在且 restore 成功 | 恢复具体会话 |
+| 磁盘 prefix 快照 | `local-llm-prefix-*.bin` 存在且 restore 成功 | 恢复项目稳定前缀 |
 | 缓存未命中 | 上述条件都不满足 | 完整 prefill |
 
 实际请求会被加上：
@@ -152,7 +152,7 @@ pi-prefix-<hash>.bin
 成功响应返回后，代理通过 llama.cpp 的 slot save API 保存：
 
 ```text
-当前 slot -> pi-session-<hash>.bin
+当前 slot -> local-llm-session-<hash>.bin
 ```
 
 同时更新内存中的 session 和 prefix slot 映射。
@@ -171,7 +171,7 @@ pi-prefix-<hash>.bin
 }
 ```
 
-这个请求的 slot 会被保存为 `pi-prefix-<hash>.bin`。它不会抢占活跃 session 的 slot；没有安全的空闲 slot 时会等待或超时放弃。
+这个请求的 slot 会被保存为 `local-llm-prefix-<hash>.bin`。它不会抢占活跃 session 的 slot；没有安全的空闲 slot 时会等待或超时放弃。
 
 纯 prefix 快照很重要。Qwen3.8 是混合 GDN 架构，不能可靠地把“包含旧 user/assistant 历史的完整快照”直接当作所有新 session 的 prefix。纯 prefix 恢复后，llama.cpp 才能把新用户消息作为 suffix 继续计算。
 
@@ -226,7 +226,7 @@ restore 失败不会让请求失败。代理会记录 warning，继续使用当�
 验证使用当前 Qwen3.8-27B IQ4_XS、llama.cpp、RX 7900 XTX 配置：
 
 - 无工具 Pi 请求的完整 prompt 约 5218 tokens；首次请求保存了约 5198-token 的纯 prefix；
-- 新建 Pi session 后，日志确认从 `pi-prefix-*.bin` restore，wall time 约 2.6 秒；同一代理接口的冷 prefix smoke 已实测返回 `cached_tokens=17`，Pi 请求走的是同一 restore 路径；
+- 新建 Pi session 后，日志确认从 `local-llm-prefix-*.bin` restore，wall time 约 2.6 秒；同一代理接口的冷 prefix smoke 已实测返回 `cached_tokens=17`，Pi 请求走的是同一 restore 路径；
 - 相比第一次完整 prefill，冷恢复把首条回复的 wall time 降到约 2.6 秒；
 - 带 `read` 工具 schema 的测试生成了约 6678-token prefix，说明工具定义也能进入缓存；
 - 同一个 session 的第二次请求日志为 `reusing hot session`，没有磁盘 restore；
@@ -247,9 +247,9 @@ restore 失败不会让请求失败。代理会记录 warning，继续使用当�
 服务：
 
 ```bash
-systemctl --user status pi-llama-cache.service
-systemctl --user is-active pi-llama-cache.service
-journalctl --user -u pi-llama-cache.service -n 100 --no-pager
+systemctl --user status local-llm-kv-cache.service
+systemctl --user is-active local-llm-kv-cache.service
+journalctl --user -u local-llm-kv-cache.service -n 100 --no-pager
 ```
 
 健康检查：
@@ -262,7 +262,7 @@ curl -fsS http://127.0.0.1:18082/v1/models
 确认真正命中：
 
 ```text
-代理日志：reusing hot session / reusing hot prefix / restored pi-prefix-...
+代理日志：reusing hot session / reusing hot prefix / restored local-llm-prefix-...
 API 响应：usage.prompt_tokens_details.cached_tokens > 0
 API timings：timings.cache_n > 0
 ```
@@ -270,7 +270,7 @@ API timings：timings.cache_n > 0
 测试：
 
 ```bash
-cd ~/.local/share/pi-llama-cache
+cd ~/.local/share/local-llm-kv-cache
 python3 -m unittest -v test_cache_core.py test_cache_proxy.py
 python3 -m py_compile cache_core.py cache_proxy.py
 ```
@@ -279,7 +279,7 @@ python3 -m py_compile cache_core.py cache_proxy.py
 
 - Pi：`~/.pi/agent/models.json`
 - Zed：`~/.config/zed/settings.json`
-- systemd 模板：[pi-llama-cache.service](./pi-llama-cache.service)；当前安装位置是 `~/.config/systemd/user/pi-llama-cache.service`
+- systemd 模板：[local-llm-kv-cache.service](./local-llm-kv-cache.service)；当前安装位置是 `~/.config/systemd/user/local-llm-kv-cache.service`
 - 代理代码：[cache_proxy.py](./cache_proxy.py)
 - key 逻辑：[cache_core.py](./cache_core.py)
 - 磁盘缓存：`~/.llama-slot-cache`

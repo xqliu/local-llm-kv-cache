@@ -103,7 +103,7 @@ class CacheProxyTests(unittest.TestCase):
 
         prefix_file = Path(self.tempdir.name, cache_filename("prefix", self.body, "prefix"))
         prefix_file.write_bytes(b"prefix snapshot")
-        files = {path.name for path in Path(self.tempdir.name).glob("pi-*.bin")}
+        files = {path.name for path in Path(self.tempdir.name).glob("local-llm-*.bin")}
         self.assertEqual(len(files), 2)
 
         other_body = {

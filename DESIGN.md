@@ -1,4 +1,4 @@
-# Pi / Zed 本地 LLM 缓存设计
+# Local LLM KV Cache Design
 
 ## 1. 目标与边界
 
@@ -140,8 +140,8 @@ snapshot_key = SHA256("2" + kind + identity + prefix_key)
 文件格式：
 
 ~~~text
-pi-session-<hash>.bin
-pi-prefix-<hash>.bin
+local-llm-session-<hash>.bin
+local-llm-prefix-<hash>.bin
 ~~~
 
 - session 的 identity 是 Pi/Zed session ID；
@@ -207,7 +207,7 @@ session_id -> slot_id + prefix_key + n_tokens
 
 ~~~text
 POST /slots/{id}?action=restore
-{"filename": "pi-prefix-....bin"}
+{"filename": "local-llm-prefix-....bin"}
 ~~~
 
 KV 二进制由 llama.cpp 从 --slot-save-path 读取，代理不解析 KV 文件。
@@ -226,21 +226,21 @@ sequenceDiagram
     P->>L: GET /slots
     L-->>P: Find idle slot
     P->>L: POST /slots/id?action=restore
-    L->>D: Read pi-prefix snapshot
+    L->>D: Read local-llm-prefix snapshot
     D-->>L: KV + recurrent state
     L-->>P: Restore complete
     P->>L: Chat request with cache_prompt=true, id_slot
     L-->>P: Stream generated answer
     P-->>C: Forward answer
     P->>L: Save full session snapshot
-    L->>D: Write pi-session snapshot
+    L->>D: Write local-llm-session snapshot
 
     opt Prefix file was missing
         P->>P: Wait for a safe idle slot
         P->>L: Pure prefix request, n_predict=0
         L-->>P: Prefix prefill complete
         P->>L: Save prefix snapshot
-        L->>D: Write pi-prefix snapshot
+        L->>D: Write local-llm-prefix snapshot
     end
 ~~~
 
@@ -286,7 +286,7 @@ flowchart TD
     SLOT --> RESERVED{"Slot belongs to active session?"}
     RESERVED -->|yes| RETRY
     RESERVED -->|no| SEED["Run pure prefix request"]
-    SEED --> SAVE["Save pi-prefix snapshot"]
+    SEED --> SAVE["Save local-llm-prefix snapshot"]
     SAVE --> DONE["Release slot and finish"]
     RETRY --> WAIT
 ~~~
@@ -386,12 +386,12 @@ restore 失败只会降级为普通 prefill，不会直接让用户请求失败�
 | [test_cache_core.py](./test_cache_core.py) | key 和 request helper 测试 |
 | [test_cache_proxy.py](./test_cache_proxy.py) | proxy save/restore/hot slot 测试 |
 | [README.md](./README.md) | 操作说明、命中判断和收益摘要 |
-| [pi-llama-cache.service](./pi-llama-cache.service) | 用户级 systemd 服务模板 |
+| [local-llm-kv-cache.service](./local-llm-kv-cache.service) | 用户级 systemd 服务模板 |
 
 运行检查：
 
 ~~~bash
 curl -fsS http://127.0.0.1:18082/health
-systemctl --user status pi-llama-cache.service
-journalctl --user -u pi-llama-cache.service -n 100 --no-pager
+systemctl --user status local-llm-kv-cache.service
+journalctl --user -u local-llm-kv-cache.service -n 100 --no-pager
 ~~~

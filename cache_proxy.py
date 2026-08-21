@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 from cache_core import build_prefix_payload, cache_filename, cache_key, with_slot_cache
 
 
-LOGGER = logging.getLogger("pi-llama-cache")
+LOGGER = logging.getLogger("local-llm-kv-cache")
 DEFAULT_CACHE_DIR = str(Path.home() / ".llama-slot-cache")
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -186,7 +186,7 @@ class LlamaCacheProxy:
         threading.Thread(
             target=self._seed_prefix,
             args=(plan.prefix_payload, plan.prefix_file, plan.slot_id),
-            name="pi-prefix-seed",
+            name="local-llm-kv-prefix-seed",
             daemon=True,
         ).start()
 

@@ -58,7 +58,7 @@ def cache_filename(identity: str, body: dict[str, Any], kind: str) -> str:
     """Build a filesystem-safe filename scoped to an identity and prefix."""
     material = f"{_CACHE_FORMAT_VERSION}\0{kind}\0{identity}\0{cache_key(body)}".encode("utf-8")
     digest = hashlib.sha256(material).hexdigest()
-    return f"pi-{kind}-{digest}.bin"
+    return f"local-llm-{kind}-{digest}.bin"
 
 
 def with_slot_cache(body: dict[str, Any], slot_id: int) -> dict[str, Any]:

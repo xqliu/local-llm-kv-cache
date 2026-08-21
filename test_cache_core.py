@@ -79,7 +79,7 @@ class CacheCoreTests(unittest.TestCase):
     def test_cache_filename_is_safe_and_stable(self):
         name = cache_filename("session/with spaces", self.body, "session")
 
-        self.assertRegex(name, r"^pi-session-[0-9a-f]{64}\.bin$")
+        self.assertRegex(name, r"^local-llm-session-[0-9a-f]{64}\.bin$")
         self.assertNotIn("/", name)
         self.assertEqual(name, cache_filename("session/with spaces", self.body, "session"))
 
