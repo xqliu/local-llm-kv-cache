@@ -9,6 +9,21 @@
 
 详细架构和 Mermaid 设计图见：[DESIGN.md](./DESIGN.md)。
 
+## Quick start
+
+要求：Python 3.10+，以及已经运行并开启 slot save/restore 的 llama.cpp server。
+
+```bash
+git clone https://github.com/xqliu/pi-llama-cache.git ~/.local/share/pi-llama-cache
+mkdir -p ~/.config/systemd/user
+cp ~/.local/share/pi-llama-cache/pi-llama-cache.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now pi-llama-cache.service
+curl -fsS http://127.0.0.1:18082/health
+```
+
+如果 llama.cpp 不在 `127.0.0.1:8080`，修改用户 unit 中的 `PI_LLAMA_UPSTREAM`。Pi 和 Zed 的 provider URL 需要指向 `http://127.0.0.1:18082/v1`。
+
 ## 解决的问题
 
 编程 agent 的第一条消息通常包含：
@@ -29,7 +44,7 @@ Pi / pi-acp / Zed
 127.0.0.1:18082  cache_proxy.py
           |
           +-- 内存 session/prefix slot 映射
-          +-- /home/xqianliu/.llama-slot-cache/*.bin
+          +-- ~/.llama-slot-cache/*.bin
           |
           v
 127.0.0.1:8080  llama.cpp llama-server
@@ -255,16 +270,20 @@ API timings：timings.cache_n > 0
 测试：
 
 ```bash
-cd /home/xqianliu/.local/share/pi-llama-cache
+cd ~/.local/share/pi-llama-cache
 python3 -m unittest -v test_cache_core.py test_cache_proxy.py
 python3 -m py_compile cache_core.py cache_proxy.py
 ```
 
 ## 当前配置入口
 
-- Pi：[~/.pi/agent/models.json](/home/xqianliu/.pi/agent/models.json)
-- Zed：[~/.config/zed/settings.json](/home/xqianliu/.config/zed/settings.json)
+- Pi：`~/.pi/agent/models.json`
+- Zed：`~/.config/zed/settings.json`
 - systemd 模板：[pi-llama-cache.service](./pi-llama-cache.service)；当前安装位置是 `~/.config/systemd/user/pi-llama-cache.service`
 - 代理代码：[cache_proxy.py](./cache_proxy.py)
 - key 逻辑：[cache_core.py](./cache_core.py)
-- 磁盘缓存：`/home/xqianliu/.llama-slot-cache`
+- 磁盘缓存：`~/.llama-slot-cache`
+
+## License
+
+Apache-2.0，详见 [LICENSE](./LICENSE)。

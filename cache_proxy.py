@@ -405,13 +405,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
     proxy: LlamaCacheProxy
 
     def do_GET(self) -> None:
-        self.proxy.forward(self, "GET", self.path, b"")
+        try:
+            self.proxy.forward(self, "GET", self.path, b"")
+        except (RuntimeError, TimeoutError, OSError) as error:
+            self._send_upstream_error(error)
+
+    def _send_upstream_error(self, error: Exception) -> None:
+        LOGGER.exception("upstream request failed")
+        if not getattr(self, "_proxy_response_started", False) and not self.wfile.closed:
+            self.send_error(503, f"upstream unavailable: {error}")
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length)
         if self.path.rstrip("/") != "/v1/chat/completions":
-            self.proxy.forward(self, "POST", self.path, raw)
+            try:
+                self.proxy.forward(self, "POST", self.path, raw)
+            except (RuntimeError, TimeoutError, OSError) as error:
+                self._send_upstream_error(error)
             return
         try:
             body = json.loads(raw or b"{}")
@@ -422,7 +433,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         session_id = _session_id(self) or _body_session_id(body) or _anonymous_session_id(body)
         if _has_media(body):
             body["cache_prompt"] = True
-            self.proxy.forward(self, "POST", self.path, json.dumps(body).encode("utf-8"))
+            try:
+                self.proxy.forward(self, "POST", self.path, json.dumps(body).encode("utf-8"))
+            except (RuntimeError, TimeoutError, OSError) as error:
+                self._send_upstream_error(error)
             return
         try:
             with self.proxy.foreground_operation():
@@ -432,10 +446,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     self.proxy.finish(plan, status)
                 except Exception:
                     LOGGER.exception("response succeeded but snapshot finalization failed")
-        except (RuntimeError, TimeoutError) as error:
-            LOGGER.exception("cache proxy request failed")
-            if not getattr(self, "_proxy_response_started", False) and not self.wfile.closed:
-                self.send_error(502, str(error))
+        except (RuntimeError, TimeoutError, OSError) as error:
+            self._send_upstream_error(error)
 
     def log_message(self, format: str, *args: Any) -> None:
         LOGGER.info("%s - %s", self.address_string(), format % args)

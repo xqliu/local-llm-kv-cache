@@ -2,11 +2,13 @@ import json
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
+from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cache_core import cache_filename
-from cache_proxy import LlamaCacheProxy, _anonymous_session_id
+from cache_proxy import LlamaCacheProxy, ProxyHandler, _anonymous_session_id
 
 
 class FakeLlamaHandler(BaseHTTPRequestHandler):
@@ -52,6 +54,15 @@ class FakeLlamaHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *_args):
         pass
+
+
+class UnavailableProxy:
+    @contextmanager
+    def foreground_operation(self):
+        yield
+
+    def prepare(self, *_args):
+        raise ConnectionRefusedError("llama is unavailable")
 
 
 class CacheProxyTests(unittest.TestCase):
@@ -171,6 +182,38 @@ class CacheProxyTests(unittest.TestCase):
 
         self.assertEqual(_anonymous_session_id(self.body), _anonymous_session_id(other_body))
         self.assertNotEqual(_anonymous_session_id(self.body), _anonymous_session_id(changed_project))
+
+    def test_upstream_unavailable_returns_503(self):
+        previous_proxy = getattr(ProxyHandler, "proxy", None)
+        ProxyHandler.proxy = UnavailableProxy()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            connection.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(
+                    {
+                        "messages": [
+                            {"role": "system", "content": "rules"},
+                            {"role": "user", "content": "hello"},
+                        ]
+                    }
+                ),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 503)
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            if previous_proxy is None:
+                delattr(ProxyHandler, "proxy")
+            else:
+                ProxyHandler.proxy = previous_proxy
 
 
 if __name__ == "__main__":
