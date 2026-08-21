@@ -30,6 +30,7 @@ class FakeLlamaHandler(BaseHTTPRequestHandler):
     restored = []
     saved = []
     restore_failed = False
+    restore_tokens = 10
     slot_tokens = 0
 
     def do_GET(self):
@@ -46,8 +47,8 @@ class FakeLlamaHandler(BaseHTTPRequestHandler):
             if self.restore_failed:
                 self._json({"error": "incompatible snapshot"}, status=500)
                 return
-            type(self).slot_tokens = 10
-            self._json({"n_restored": 10})
+            type(self).slot_tokens = self.restore_tokens
+            self._json({"n_restored": self.restore_tokens})
             return
         if "action=save" in self.path:
             filename = payload["filename"]
@@ -198,6 +199,7 @@ class CacheProxyTests(unittest.TestCase):
         FakeLlamaHandler.restored = []
         FakeLlamaHandler.saved = []
         FakeLlamaHandler.restore_failed = False
+        FakeLlamaHandler.restore_tokens = 10
         FakeLlamaHandler.slot_tokens = 0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeLlamaHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -222,9 +224,9 @@ class CacheProxyTests(unittest.TestCase):
         self.server.server_close()
         self.tempdir.cleanup()
 
-    def test_session_snapshot_is_saved_and_prefix_snapshot_is_reused(self):
+    def test_session_snapshot_is_saved_and_restored(self):
         request, plan = self.proxy.prepare(self.body, "session-a")
-        self.assertEqual(request["id_slot"], 0)
+        self.assertNotIn("id_slot", request)
         self.proxy.finish(plan, 200)
 
         prefix_file = Path(self.tempdir.name, cache_filename("prefix", self.body, "prefix"))
@@ -243,7 +245,8 @@ class CacheProxyTests(unittest.TestCase):
             wait_seconds=1,
             enable_prefix_seeding=False,
         )
-        cold_proxy.prepare(other_body, "session-b")
+        request, _ = cold_proxy.prepare(other_body, "session-b")
+        self.assertNotIn("id_slot", request)
         self.assertEqual(len(FakeLlamaHandler.restored), 1)
 
     def test_incompatible_snapshot_falls_back_to_current_slot(self):
@@ -266,7 +269,6 @@ class CacheProxyTests(unittest.TestCase):
         )
         request, plan = cold_proxy.prepare(other_body, "session-b")
 
-        self.assertEqual(request["id_slot"], 0)
         self.assertEqual(len(FakeLlamaHandler.restored), 1)
 
     def test_same_session_reuses_hot_slot_without_disk_restore(self):
@@ -409,8 +411,9 @@ class CacheProxyTests(unittest.TestCase):
         self.proxy.finish(second_plan, 200)
         FakeLlamaHandler.restored = []
 
-        self.proxy.prepare(self.body, "session-a")
+        request, _ = self.proxy.prepare(self.body, "session-a")
 
+        self.assertNotIn("id_slot", request)
         self.assertEqual(
             FakeLlamaHandler.restored,
             [cache_filename("session-a", self.body, "session")],
@@ -426,7 +429,115 @@ class CacheProxyTests(unittest.TestCase):
         with patch.object(self.proxy, "_slots", return_value=slots):
             request, _ = self.proxy.prepare(self.body, "session-b")
 
-        self.assertEqual(request["id_slot"], 0)
+        self.assertNotIn("id_slot", request)
+
+    def test_new_session_leaves_slot_selection_to_llama(self):
+        request, plan = self.proxy.prepare(self.body, "session-new")
+
+        self.assertNotIn("id_slot", request)
+        self.assertIsNone(plan.slot_id)
+        self.assertIsNotNone(plan.candidate_slot_id)
+
+    def test_new_session_restores_disk_snapshot_before_native_selection(self):
+        snapshot = Path(self.tempdir.name, cache_filename("session-new", self.body, "session"))
+        snapshot.write_bytes(b"snapshot")
+        self.proxy._restore_first_available = Mock(return_value=snapshot)
+
+        request, plan = self.proxy.prepare(self.body, "session-new")
+
+        self.assertNotIn("id_slot", request)
+        self.assertIsNone(plan.slot_id)
+        self.proxy._restore_first_available.assert_called_once_with(0, (snapshot,))
+
+    def test_fallback_resolves_slot_changed_by_native_scheduler(self):
+        plan = SnapshotPlan(
+            "session-new",
+            None,
+            "prefix",
+            Path(self.tempdir.name, "session.bin"),
+            Path(self.tempdir.name, "prefix.bin"),
+            {"messages": []},
+            True,
+            0,
+            {0: 10, 1: 20},
+        )
+        self.proxy._slots = Mock(
+            return_value=[
+                {"id": 0, "id_task": 11, "is_processing": False, "n_prompt_tokens": 10},
+                {"id": 1, "id_task": 20, "is_processing": False, "n_prompt_tokens": 20},
+            ]
+        )
+
+        self.assertEqual(self.proxy._resolve_slot(plan), 0)
+
+    def test_fallback_slot_resolution_handles_pinned_and_waiting_states(self):
+        pinned = SnapshotPlan(
+            "session-a",
+            1,
+            "prefix",
+            Path(self.tempdir.name, "session.bin"),
+            Path(self.tempdir.name, "prefix.bin"),
+            {"messages": []},
+            True,
+        )
+        self.assertEqual(self.proxy._resolve_slot(pinned), 1)
+
+        waiting = SnapshotPlan(
+            "session-b",
+            None,
+            "prefix",
+            pinned.session_file,
+            pinned.prefix_file,
+            pinned.prefix_payload,
+            True,
+            0,
+            {0: 1},
+        )
+        self.proxy._slots = Mock(
+            return_value=[{"id": 0, "id_task": 1, "is_processing": True}]
+        )
+        self.assertEqual(self.proxy._resolve_slot(waiting), 0)
+
+        no_candidate = SnapshotPlan(
+            "session-c",
+            None,
+            "prefix",
+            pinned.session_file,
+            pinned.prefix_file,
+            pinned.prefix_payload,
+            True,
+        )
+        with patch.object(self.proxy, "_wait_for_idle_slot", return_value=1):
+            self.assertEqual(self.proxy._resolve_slot(no_candidate), 1)
+
+    def test_restore_tries_next_existing_snapshot_source(self):
+        missing = Path(self.tempdir.name, "missing.bin")
+        existing = Path(self.tempdir.name, "existing.bin")
+        existing.write_bytes(b"snapshot")
+
+        restored = self.proxy._restore_first_available(0, (missing, existing))
+
+        self.assertEqual(restored, existing)
+        self.assertEqual(FakeLlamaHandler.restored, ["existing.bin"])
+
+    def test_zero_token_restore_is_treated_as_failure(self):
+        source = Path(self.tempdir.name, "empty.bin")
+        source.write_bytes(b"snapshot")
+        FakeLlamaHandler.restore_tokens = 0
+
+        restored = self.proxy._restore_first_available(0, (source,))
+
+        self.assertIsNone(restored)
+
+    def test_hot_session_finish_keeps_pinned_slot(self):
+        _, first_plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(first_plan, 200)
+        _, hot_plan = self.proxy.prepare(self.body, "session-a")
+
+        self.proxy.finish(hot_plan, 200)
+
+        self.assertEqual(hot_plan.slot_id, 0)
+        self.assertEqual(FakeLlamaHandler.saved[-1].endswith(".tmp"), True)
 
     def test_prefix_seed_skips_when_no_safe_idle_slot_exists(self):
         self.proxy.session_states["session-a"] = SlotState(1, cache_key(self.body), 10)

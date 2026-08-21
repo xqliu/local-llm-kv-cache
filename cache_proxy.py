@@ -16,7 +16,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -44,12 +44,14 @@ HOP_BY_HOP_HEADERS = {
 @dataclass(frozen=True)
 class SnapshotPlan:
     session_id: str
-    slot_id: int
+    slot_id: int | None
     prefix_key: str
     session_file: Path
     prefix_file: Path
     prefix_payload: dict[str, Any]
     prefix_was_present: bool
+    candidate_slot_id: int | None = None
+    slot_task_ids: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -95,14 +97,20 @@ class LlamaCacheProxy:
         prefix_payload = build_prefix_payload(body)
         hot_state = self._hot_state(self.session_states.get(session_id), prefix_key)
         restored_source = None
+        candidate_slot_id = None
+        slot_task_ids: dict[int, int] = {}
         if hot_state is not None:
             slot_id = hot_state.slot_id
             LOGGER.info("reusing hot session %s in slot %d", session_id, slot_id)
         else:
             hot_state = None
-            slot_id = self._wait_for_idle_slot()
-            self._forget_slot(slot_id)
-            restored_source = self._restore_first_available(slot_id, (session_file, prefix_file))
+            candidate_slot_id = self._wait_for_idle_slot()
+            sources = tuple(path for path in (session_file, prefix_file) if path.exists())
+            if sources:
+                self._forget_slot(candidate_slot_id)
+                restored_source = self._restore_first_available(candidate_slot_id, sources)
+            slot_id = None
+            slot_task_ids = self._slot_task_ids()
         plan = SnapshotPlan(
             session_id=session_id,
             slot_id=slot_id,
@@ -111,6 +119,8 @@ class LlamaCacheProxy:
             prefix_file=prefix_file,
             prefix_payload=prefix_payload,
             prefix_was_present=prefix_file.exists() and (restored_source is not None or hot_state is not None),
+            candidate_slot_id=candidate_slot_id,
+            slot_task_ids=slot_task_ids,
         )
         return with_slot_cache(body, slot_id), plan
 
@@ -119,22 +129,25 @@ class LlamaCacheProxy:
             if not source.exists():
                 continue
             try:
-                self._restore(slot_id, source)
+                n_restored = self._restore(slot_id, source)
             except RuntimeError as error:
                 LOGGER.warning("could not restore %s: %s; continuing without disk restore", source.name, error)
                 continue
-            LOGGER.info("restored %s into slot %d", source.name, slot_id)
+            LOGGER.info("restored %s into slot %d (%s tokens)", source.name, slot_id, n_restored)
             return source
         return None
 
     def finish(self, plan: SnapshotPlan, status: int) -> None:
         if status < 200 or status >= 300:
             return
-        n_saved = self._save(plan.slot_id, plan.session_file)
-        state = SlotState(plan.slot_id, plan.prefix_key, n_saved)
+        slot_id = self._resolve_slot(plan)
+        if plan.slot_id is None:
+            self._forget_slot(slot_id)
+        n_saved = self._save(slot_id, plan.session_file)
+        state = SlotState(slot_id, plan.prefix_key, n_saved)
         self.session_states[plan.session_id] = state
         if not plan.prefix_was_present:
-            self._schedule_prefix_seed(plan)
+            self._schedule_prefix_seed(replace(plan, slot_id=slot_id))
         self._prune()
 
     def _hot_state(self, state: SlotState | None, prefix_key: str) -> SlotState | None:
@@ -221,6 +234,28 @@ class LlamaCacheProxy:
     def _has_foreground_waiters(self) -> bool:
         with self.foreground_waiters_lock:
             return self.foreground_waiters > 0
+
+    def _slot_task_ids(self) -> dict[int, int]:
+        return {
+            int(slot.get("id", -1)): int(slot.get("id_task") or -1)
+            for slot in self._slots()
+        }
+
+    def _resolve_slot(self, plan: SnapshotPlan) -> int:
+        if plan.slot_id is not None:
+            return plan.slot_id
+        slots = [slot for slot in self._slots() if not slot.get("is_processing")]
+        changed = [
+            slot
+            for slot in slots
+            if int(slot.get("id_task") or -1) != plan.slot_task_ids.get(int(slot.get("id", -1)), -1)
+        ]
+        candidates = changed or slots
+        if candidates:
+            return int(max(candidates, key=lambda slot: int(slot.get("id_task") or -1)).get("id", 0))
+        if plan.candidate_slot_id is not None:
+            return plan.candidate_slot_id
+        return self._wait_for_idle_slot()
 
     def _idle_slots(self, excluded_slot_ids: set[int] | None = None) -> list[dict[str, Any]]:
         excluded = excluded_slot_ids or set()
@@ -328,8 +363,16 @@ class LlamaCacheProxy:
             time.sleep(0.5)
         raise TimeoutError("no idle llama slot became available")
 
-    def _restore(self, slot_id: int, filename: Path) -> None:
-        self._json_request("POST", f"/slots/{slot_id}?action=restore", {"filename": filename.name})
+    def _restore(self, slot_id: int, filename: Path) -> int:
+        result = self._json_request(
+            "POST",
+            f"/slots/{slot_id}?action=restore",
+            {"filename": filename.name},
+        )
+        n_restored = int(result.get("n_restored") or 0)
+        if n_restored <= 0:
+            raise RuntimeError(f"llama restored no tokens from {filename.name}")
+        return n_restored
 
     def _save(self, slot_id: int, target: Path) -> int:
         temporary = target.with_suffix(target.suffix + ".tmp")
@@ -434,7 +477,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         body = _without_proxy_affinity_fields(body)
         session_id = _session_id(self) or body_session_id or _anonymous_session_id(body)
         if _has_media(body):
-            body["cache_prompt"] = True
             try:
                 self.proxy.forward(self, "POST", self.path, json.dumps(body).encode("utf-8"))
             except (RuntimeError, TimeoutError, OSError) as error:

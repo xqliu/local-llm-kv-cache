@@ -69,12 +69,18 @@ class CacheCoreTests(unittest.TestCase):
         self.assertEqual(prefix["tools"], self.body["tools"])
         self.assertNotIn("first request", str(prefix))
 
-    def test_slot_request_forces_prompt_cache_and_slot_affinity(self):
+    def test_slot_request_only_adds_slot_affinity(self):
         request = with_slot_cache(self.body, 1)
 
-        self.assertTrue(request["cache_prompt"])
         self.assertEqual(request["id_slot"], 1)
+        self.assertNotIn("cache_prompt", request)
         self.assertEqual(request["messages"], self.body["messages"])
+
+    def test_slot_request_can_leave_slot_selection_to_llama(self):
+        request = with_slot_cache(self.body, None)
+
+        self.assertNotIn("id_slot", request)
+        self.assertNotIn("cache_prompt", request)
 
     def test_cache_filename_is_safe_and_stable(self):
         name = cache_filename("session/with spaces", self.body, "session")

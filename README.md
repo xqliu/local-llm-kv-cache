@@ -5,13 +5,15 @@
 1. 同一会话的内存热缓存，继续对话时直接复用 llama.cpp slot。
 2. 项目稳定前缀的磁盘冷缓存，代理或 llama 重启后，新会话可以恢复 system prompt 和工具 schema 的 KV 状态。
 
-当前入口是 `127.0.0.1:18082`，上游仍是原来的 llama.cpp 服务 `127.0.0.1:8080`。llama 主服务没有被替换或重启。
+当前入口是 `127.0.0.1:18082`，上游是 `127.0.0.1:8080`。prompt cache 的实际计算和 checkpoint restore 都由 llama.cpp 完成，proxy 不伪造命中。
+
+重要：Qwen3.8 这类 hybrid/recurrent 模型必须使用带 checkpoint 持久化修复的 llama.cpp。本机使用分支 `local/kv-restore-checkpoints`、提交 `862535a`；未修复的 llama.cpp 可能返回 `n_restored > 0`，但下一条请求仍然 `cache_n=0`。对应的上游修复讨论见 [llama.cpp PR #26004](https://github.com/ggml-org/llama.cpp/pull/26004)。
 
 详细架构和 Mermaid 设计图见：[DESIGN.md](./DESIGN.md)。
 
 ## Quick start
 
-要求：Python 3.10+，以及已经运行并开启 slot save/restore 的 llama.cpp server。
+要求：Python 3.10+，以及已经运行并开启 slot save/restore、包含 hybrid checkpoint 持久化修复的 llama.cpp server。
 
 ```bash
 git clone https://github.com/xqliu/local-llm-kv-cache.git ~/.local/share/local-llm-kv-cache
@@ -54,7 +56,7 @@ Pi / pi-acp / Zed
 
 ### Slot ownership
 
-同一个 session 的 slot 状态是代理的唯一内存真相。请求不会为了复用另一个 session 的稳定 prefix 而抢占其完整上下文；没有可用的 hot session 时，代理优先选择没有 session 所有权的空闲 slot，再按以下顺序恢复：
+同一个 session 的 slot 状态是代理的内存 affinity 记录。请求不会为了复用另一个 session 的稳定 prefix 而抢占其完整上下文；没有可用的 hot session 时，代理优先选择没有 session 所有权的空闲 slot，再按以下顺序恢复：
 
 ```text
 hot session → session snapshot → prefix snapshot → full prefill
@@ -134,7 +136,7 @@ local-llm-prefix-<hash>.bin
 4. 请求体中的 `session_id` 或 `prompt_cache_key`
 5. 没有显式 ID 时，使用 `anonymous-<prefix_key>`
 
-图片和其他非文本多模态请求不做磁盘快照，只转发 `cache_prompt=true`。
+图片和其他非文本多模态请求不做磁盘快照，只转发请求。`cache_prompt` 使用 llama-server 的服务级默认值（当前默认开启），proxy 不再给每个请求重复添加这个字段。
 
 ### 2. 查找缓存
 
@@ -148,14 +150,15 @@ local-llm-prefix-<hash>.bin
 | 磁盘 prefix 快照 | `local-llm-prefix-*.bin` 存在且 restore 成功 | 恢复项目稳定前缀 |
 | 缓存未命中 | 上述条件都不满足 | 完整 prefill |
 
-实际请求会被加上：
+只有 hot session 请求会被加上 slot affinity；冷请求不指定 slot，让 llama.cpp 做 native LCP 选择：
 
 ```json
 {
-  "cache_prompt": true,
   "id_slot": 1
 }
 ```
+
+冷请求不会添加 `id_slot`。`cache_prompt` 由 llama-server 的默认配置控制；如果客户端显式传入 `cache_prompt=false`，则会按客户端要求关闭缓存。
 
 ### 3. 保存 session
 
@@ -235,12 +238,10 @@ restore 失败不会让请求失败。代理会记录 warning，继续使用当�
 
 验证使用当前 Qwen3.8-27B IQ4_XS、llama.cpp、RX 7900 XTX 配置：
 
-- 无工具 Pi 请求的完整 prompt 约 5218 tokens；首次请求保存了约 5198-token 的纯 prefix；
-- 新建 Pi session 后，日志确认从 `local-llm-prefix-*.bin` restore，wall time 约 2.6 秒；同一代理接口的冷 prefix smoke 已实测返回 `cached_tokens=17`，Pi 请求走的是同一 restore 路径；
-- 相比第一次完整 prefill，冷恢复把首条回复的 wall time 降到约 2.6 秒；
-- 带 `read` 工具 schema 的测试生成了约 6678-token prefix，说明工具定义也能进入缓存；
-- 同一个 session 的第二次请求日志为 `reusing hot session`，没有磁盘 restore；
-- Zed 无显式 session header 的直连请求也能按 anonymous prefix affinity 命中 `cached_tokens`。
+- patched llama.cpp 的 32,185-token 实测：冷 prefill `54.8s`；同进程 restore 后 `cache_n=32151`、`prompt_n=34`、`0.37s`；
+- 完整重启 llama 后再 restore 12,700-token snapshot：`n_restored=12700`，下一条 divergent prompt 为 `cache_n=12662`、`prompt_n=38`、`0.356s`；
+- 真实 proxy 链路中，session 被另一会话挤出后 restore 仍返回 `cached_tokens=12743/12793`；
+- 未修复的 llama.cpp 在相同 restore 场景中会返回 `n_restored`，但 `cache_n=0`，因此不能只看 restore 日志判断命中。
 
 对于更大的编程 agent prompt，收益主要来自跳过稳定 system prompt、项目规则和工具 schema 的 prefill。能节省多少时间取决于实际 token 数和当前 prompt processing throughput，但跳过的 token 数会直接体现在 `cached_tokens` / `timings.cache_n` 中。
 

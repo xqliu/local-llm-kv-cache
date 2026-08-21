@@ -61,9 +61,9 @@ def cache_filename(identity: str, body: dict[str, Any], kind: str) -> str:
     return f"local-llm-{kind}-{digest}.bin"
 
 
-def with_slot_cache(body: dict[str, Any], slot_id: int) -> dict[str, Any]:
-    """Copy a request and force llama.cpp prompt cache plus slot affinity."""
+def with_slot_cache(body: dict[str, Any], slot_id: int | None) -> dict[str, Any]:
+    """Copy a request and optionally pin it to a llama slot."""
     request = copy.deepcopy(body)
-    request["cache_prompt"] = True
-    request["id_slot"] = int(slot_id)
+    if slot_id is not None:
+        request["id_slot"] = int(slot_id)
     return request

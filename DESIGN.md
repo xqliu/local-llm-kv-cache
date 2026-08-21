@@ -12,6 +12,10 @@
 - 不缓存答案，不改变模型生成和采样逻辑；
 - 保持现有 llama.cpp + GGUF + AMD 运行链路。
 
+前提：Qwen3.8 的磁盘 restore 依赖 hybrid checkpoint 持久化。stock llama.cpp
+可能返回成功的 `n_restored`，但后续 `cache_n` 仍为 0；部署必须使用本机
+`local/kv-restore-checkpoints` 分支的 `862535a` 或等价上游修复。
+
 非目标：
 
 - 不做 response/result cache；
@@ -29,7 +33,7 @@ flowchart LR
         A["Session affinity"]
         K["Prefix key builder"]
         H["Hot slot map<br/>session_states"]
-        R["Hit selection<br/>session hot -> disk -> miss"]
+        R["Hit selection<br/>session hot -> disk -> native LCP"]
         S["Snapshot manager"]
         A --> K --> R
         H --> R
@@ -155,7 +159,7 @@ local-llm-prefix-<hash>.bin
 ~~~mermaid
 flowchart TD
     START["Chat completion request"] --> MEDIA{"Has image or non-text media?"}
-    MEDIA -->|yes| BYPASS["cache_prompt=true<br/>forward without disk snapshot"]
+    MEDIA -->|yes| BYPASS["forward without disk snapshot"]
     MEDIA -->|no| ID["Resolve session affinity"]
     ID --> KEY["Build prefix_key"]
     KEY --> HOTS{"Hot session matches?"}
@@ -167,11 +171,13 @@ flowchart TD
     DP -->|yes and restore succeeds| DPR["Restore prefix snapshot"]
     DP -->|no or restore fails| MISS["Use selected slot and full prefill"]
 
-    HS --> SEND["cache_prompt=true + id_slot"]
-    DSR --> SEND
-    DPR --> SEND
-    MISS --> SEND
-    SEND --> RESP["Generate current response"]
+    HS --> SEND["id_slot only for hot session"]
+    DSR --> NATIVE["no id_slot<br/>native LCP"]
+    DPR --> NATIVE
+    MISS --> NATIVE
+    NATIVE --> RESP
+    SEND --> RESP
+    RESP["Generate current response<br/>cache_prompt comes from llama default"]
     RESP --> SAVE["Save current session snapshot"]
     SAVE --> SEED{"Prefix file missing?"}
     SEED -->|yes| BG["Background pure-prefix seed"]
@@ -197,7 +203,7 @@ session_id -> slot_id + prefix_key + n_tokens
 
 ### 5.2 Prefix fallback
 
-代理不维护跨 session 的 hot prefix 所有权。这样一个新 session 不会为了复用另一个 session 的 prefix 而覆盖其完整动态历史。代理先选择没有 session 所有权的空闲 slot，再尝试恢复 `local-llm-prefix-*.bin`；如果没有安全空闲 slot，则选择最少 prompt token 的空闲 slot并依赖 llama.cpp 的 `cache_prompt=true` 做自然的 common-prefix 匹配。
+代理不维护跨 session 的 hot prefix 所有权。这样一个新 session 不会为了复用另一个 session 的 prefix 而覆盖其完整动态历史。代理先选择没有 session 所有权的空闲 slot，再尝试恢复 `local-llm-prefix-*.bin`；恢复后不强制 slot，由 llama.cpp 做 native LCP 选择。`cache_prompt` 使用 llama-server 的服务级默认值。
 
 ### 5.3 Disk prefix
 
@@ -228,7 +234,7 @@ sequenceDiagram
     L->>D: Read session snapshot, then prefix fallback
     D-->>L: KV + recurrent state
     L-->>P: Restore complete
-    P->>L: Chat request with cache_prompt=true, id_slot
+    P->>L: Chat request (cache_prompt default; hot only has id_slot)
     L-->>P: Stream generated answer
     P-->>C: Forward answer
     P->>L: Save full session snapshot
@@ -255,7 +261,7 @@ sequenceDiagram
     participant L as llama.cpp
 
     C->>P: Turn 1
-    P->>L: Full prompt, cache_prompt=true
+    P->>L: Full prompt (cache_prompt default)
     L-->>P: Answer 1
     P->>L: Save session snapshot
     P->>M: session_id -> slot_id
