@@ -351,7 +351,7 @@ class LlamaCacheProxy:
 
     def _prune(self) -> None:
         files = sorted(
-            self.cache_dir.glob("pi-*.bin"),
+            self.cache_dir.glob("local-llm-*.bin"),
             key=lambda path: path.stat().st_mtime,
         )
         total = sum(path.stat().st_size for path in files)
@@ -429,8 +429,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_error(400, "request body must be JSON")
             return
+        if not isinstance(body, dict):
+            self.send_error(400, "request body must be a JSON object")
+            return
+        body_session_id = _body_session_id(body)
         body = _without_proxy_affinity_fields(body)
-        session_id = _session_id(self) or _body_session_id(body) or _anonymous_session_id(body)
+        session_id = _session_id(self) or body_session_id or _anonymous_session_id(body)
         if _has_media(body):
             body["cache_prompt"] = True
             try:

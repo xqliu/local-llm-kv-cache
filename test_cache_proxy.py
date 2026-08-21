@@ -65,6 +65,32 @@ class UnavailableProxy:
         raise ConnectionRefusedError("llama is unavailable")
 
 
+class CapturingProxy:
+    def __init__(self):
+        self.session_ids = []
+
+    @contextmanager
+    def foreground_operation(self):
+        yield
+
+    def prepare(self, body, session_id):
+        self.session_ids.append(session_id)
+        return body, None
+
+    def forward(self, handler, *_args):
+        raw = b"{}"
+        setattr(handler, "_proxy_response_started", True)
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(raw)))
+        handler.end_headers()
+        handler.wfile.write(raw)
+        return 200
+
+    def finish(self, *_args):
+        pass
+
+
 class CacheProxyTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -206,6 +232,81 @@ class CacheProxyTests(unittest.TestCase):
             response = connection.getresponse()
             response.read()
             self.assertEqual(response.status, 503)
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            if previous_proxy is None:
+                delattr(ProxyHandler, "proxy")
+            else:
+                ProxyHandler.proxy = previous_proxy
+
+    def test_prune_removes_local_llm_snapshots_over_limit(self):
+        proxy = LlamaCacheProxy(
+            upstream=f"http://127.0.0.1:{self.server.server_port}",
+            cache_dir=self.tempdir.name,
+            max_cache_gib=0,
+            wait_seconds=1,
+            enable_prefix_seeding=False,
+        )
+        snapshot = Path(self.tempdir.name, "local-llm-session-old.bin")
+        snapshot.write_bytes(b"snapshot")
+
+        proxy._prune()
+
+        self.assertFalse(snapshot.exists())
+
+    def test_body_session_id_is_used_for_affinity(self):
+        previous_proxy = getattr(ProxyHandler, "proxy", None)
+        capturing_proxy = CapturingProxy()
+        ProxyHandler.proxy = capturing_proxy
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            connection.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(
+                    {
+                        "session_id": "body-session",
+                        "messages": [
+                            {"role": "system", "content": "rules"},
+                            {"role": "user", "content": "hello"},
+                        ],
+                    }
+                ),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(capturing_proxy.session_ids, ["body-session"])
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            if previous_proxy is None:
+                delattr(ProxyHandler, "proxy")
+            else:
+                ProxyHandler.proxy = previous_proxy
+
+    def test_non_object_json_returns_400(self):
+        previous_proxy = getattr(ProxyHandler, "proxy", None)
+        ProxyHandler.proxy = UnavailableProxy()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            connection.request(
+                "POST",
+                "/v1/chat/completions",
+                body="[]",
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 400)
         finally:
             connection.close()
             server.shutdown()
