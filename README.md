@@ -16,9 +16,10 @@
 要求：Python 3.10+，以及已经运行并开启 slot save/restore、包含 hybrid checkpoint 持久化修复的 llama.cpp server。
 
 ```bash
-git clone https://github.com/xqliu/local-llm-kv-cache.git ~/.local/share/local-llm-kv-cache
+mkdir -p ~/server-ops
+git clone https://github.com/xqliu/local-llm-kv-cache.git ~/server-ops/local-llm-kv-cache
 mkdir -p ~/.config/systemd/user
-cp ~/.local/share/local-llm-kv-cache/local-llm-kv-cache.service ~/.config/systemd/user/
+cp ~/server-ops/local-llm-kv-cache/local-llm-kv-cache.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now local-llm-kv-cache.service
 curl -fsS http://127.0.0.1:18082/health
@@ -281,7 +282,7 @@ API timings：timings.cache_n > 0
 测试：
 
 ```bash
-cd ~/.local/share/local-llm-kv-cache
+cd ~/server-ops/local-llm-kv-cache
 python3 -m unittest -v test_cache_core.py test_cache_proxy.py
 python3 -m py_compile cache_core.py cache_proxy.py
 python3 -m pip install coverage

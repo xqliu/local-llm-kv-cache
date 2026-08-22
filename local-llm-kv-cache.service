@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/.local/share/local-llm-kv-cache
-ExecStart=/usr/bin/python3 %h/.local/share/local-llm-kv-cache/cache_proxy.py
+WorkingDirectory=%h/server-ops/local-llm-kv-cache
+ExecStart=/usr/bin/python3 %h/server-ops/local-llm-kv-cache/cache_proxy.py
 Environment=PI_LLAMA_UPSTREAM=http://127.0.0.1:8080
 Environment=PI_LLAMA_CACHE_HOST=127.0.0.1
 Environment=PI_LLAMA_CACHE_PORT=18082
